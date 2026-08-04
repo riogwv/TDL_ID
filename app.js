@@ -3,6 +3,7 @@
 // ─── STATE ────────────────────────────────────────────────────────────────────
 const state = {
   user: null,
+  profile: { displayName: '', bio: '', photoURL: '' },
   tasks: [],
   projects: [],
   labels: [],
@@ -109,6 +110,7 @@ const DB = {
       state.labels   = d.labels   || [];
       state.notes    = d.notes    || [];
       state.settings = { ...state.settings, ...(d.settings || {}) };
+      state.profile  = { ...state.profile,  ...(d.profile  || {}) };
       if (!state.tasks.length) DB.seed();
     } catch(e) { DB.seed(); }
   },
@@ -116,7 +118,7 @@ const DB = {
     localStorage.setItem('flow_data', JSON.stringify({
       tasks: state.tasks, projects: state.projects,
       labels: state.labels, notes: state.notes,
-      settings: state.settings
+      settings: state.settings, profile: state.profile
     }));
   },
   seed() {
@@ -155,10 +157,23 @@ function isFirebaseReady() {
 function initFirebase() {
   if (!isFirebaseReady()) return false;
   try {
-    window._fb.onAuthStateChanged(window._fb.auth, user => {
+    window._fb.onAuthStateChanged(window._fb.auth, async user => {
       if (user) {
         state.demoMode = false;
         state.user = user;
+        // Load persisted profile from Firestore if available.
+        try {
+          const { db, doc, getDoc } = window._fb;
+          const snap = await getDoc(doc(db, 'profiles', user.uid));
+          if (snap.exists()) {
+            const d = snap.data();
+            state.profile = {
+              displayName: d.displayName || '',
+              photoURL:    d.photoURL    || '',
+              bio:         d.bio         || ''
+            };
+          }
+        } catch (_) { /* non-fatal */ }
         showApp(user);
         subscribeFirestore(user.uid);
       } else {
@@ -232,6 +247,47 @@ async function fbDeleteNote(id) {
   return fbDelete('notes', id);
 }
 
+// Profile modal button wiring (elements added to HTML)
+document.addEventListener('DOMContentLoaded', () => {
+  // ── User menu trigger ──────────────────────────────────────────────────────
+  const trigger = $('user-menu-trigger');
+  if (trigger) {
+    trigger.addEventListener('click',   openProfileModal);
+    trigger.addEventListener('keydown', e => e.key === 'Enter' && openProfileModal());
+  }
+
+  // ── Profile modal controls ─────────────────────────────────────────────────
+  $('profile-modal-close')?.addEventListener('click',  () => closeModal('profile-modal-overlay'));
+  $('profile-modal-cancel')?.addEventListener('click', () => closeModal('profile-modal-overlay'));
+  $('profile-modal-save')?.addEventListener('click',   saveProfile);
+
+  // Photo preview on URL input
+  $('profile-photo-input')?.addEventListener('input', () => {
+    const url  = $('profile-photo-input').value.trim();
+    const prev = $('profile-photo-preview');
+    if (prev) {
+      prev.src          = url;
+      prev.style.display= url ? 'block' : 'none';
+    }
+  });
+
+  // File upload for profile picture
+  $('profile-photo-upload')?.addEventListener('change', e => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    if (!file.type.startsWith('image/')) { toast('Please select an image file'); return; }
+    const reader = new FileReader();
+    reader.onload = ev => {
+      const dataUrl = ev.target.result;
+      const photoInput = $('profile-photo-input');
+      if (photoInput) photoInput.value = dataUrl;
+      const prev = $('profile-photo-preview');
+      if (prev) { prev.src = dataUrl; prev.style.display = 'block'; }
+    };
+    reader.readAsDataURL(file);
+  });
+});
+
 // ─── AUTH ─────────────────────────────────────────────────────────────────────
 function updateAuthUI(firebaseAvailable) {
   const note = $('auth-demo-note');
@@ -262,18 +318,96 @@ function showAuth() {
 function showApp(user) {
   $('auth-screen').style.display = 'none';
   $('app').classList.remove('hidden');
-  $('user-display-name').textContent  = user?.displayName || 'Demo User';
-  $('user-display-email').textContent = user?.email       || 'demo@flow.app';
-  const settingsEmail = $('settings-user-email');
-  if (settingsEmail) settingsEmail.textContent = user?.email || 'demo@flow.app';
-  const av = $('user-avatar');
-  if (user?.photoURL) {
-    av.innerHTML = `<img src="${escapeHtml(user.photoURL)}" alt="Avatar">`;
-  } else {
-    av.textContent = (user?.displayName || 'D').split(' ').map(w => w[0]).join('').toUpperCase().slice(0,2);
-  }
+  refreshUserDisplay();
   applySettings();
   renderAll();
+}
+
+function refreshUserDisplay() {
+  const user = state.user;
+  // Profile state overrides Firebase user fields if set.
+  const displayName = state.profile.displayName || user?.displayName || 'Demo User';
+  const email       = user?.email || 'demo@flow.app';
+  const photoURL    = state.profile.photoURL || user?.photoURL || '';
+
+  $('user-display-name').textContent  = displayName;
+  $('user-display-email').textContent = email;
+  const settingsEmail = $('settings-user-email');
+  if (settingsEmail) settingsEmail.textContent = email;
+
+  const av = $('user-avatar');
+  if (photoURL) {
+    av.innerHTML = `<img src="${escapeHtml(photoURL)}" alt="Avatar" style="width:100%;height:100%;object-fit:cover;border-radius:50%">`;
+  } else {
+    av.textContent = displayName.split(' ').filter(Boolean).map(w => w[0]).join('').toUpperCase().slice(0, 2);
+  }
+}
+
+// ─── PROFILE MODAL ────────────────────────────────────────────────────────────
+function openProfileModal() {
+  const overlay   = $('profile-modal-overlay');
+  const nameInput = $('profile-name-input');
+  const photoInput= $('profile-photo-input');
+  const bioInput  = $('profile-bio-input');
+
+  // Fail-safe: abort if any required modal element is missing.
+  if (!overlay || !nameInput || !photoInput || !bioInput) {
+    console.error('[Flow] openProfileModal: one or more required modal elements are missing.');
+    return;
+  }
+
+  const user = state.user;
+  nameInput.value  = state.profile.displayName || user?.displayName || '';
+  photoInput.value = state.profile.photoURL    || user?.photoURL    || '';
+  bioInput.value   = state.profile.bio         || '';
+
+  // Sync photo preview with current URL value.
+  const prev = $('profile-photo-preview');
+  if (prev) {
+    prev.src          = photoInput.value;
+    prev.style.display= photoInput.value ? 'block' : 'none';
+  }
+
+  openModal('profile-modal-overlay');
+  setTimeout(() => nameInput.focus(), 80);
+}
+
+// user-menu-trigger listeners are wired inside the DOMContentLoaded block below.
+
+async function saveProfile() {
+  const displayName = $('profile-name-input').value.trim();
+  const photoURL    = $('profile-photo-input').value.trim();
+  const bio         = $('profile-bio-input').value.trim();
+
+  if (!displayName) { toast('Enter a display name'); $('profile-name-input').focus(); return; }
+
+  state.profile = { displayName, photoURL, bio };
+
+  if (state.demoMode) {
+    DB.save();
+  } else if (isFirebaseReady() && state.user) {
+    const { db, doc, setDoc, serverTimestamp } = window._fb;
+    try {
+      // updateProfile for display name / photo
+      const { updateProfile } = await import('https://www.gstatic.com/firebasejs/10.8.0/firebase-auth.js');
+      await updateProfile(state.user, {
+        displayName: displayName || undefined,
+        photoURL:    photoURL    || undefined
+      });
+      // Also persist full profile (including bio) to Firestore
+      await setDoc(doc(db, 'profiles', state.user.uid), {
+        displayName, photoURL, bio, updatedAt: serverTimestamp()
+      }, { merge: true });
+    } catch (err) {
+      console.error('[Flow] Profile update failed:', err);
+      toast('Profile saved locally (Firebase update failed)');
+      // Still persist locally as fallback
+    }
+  }
+
+  refreshUserDisplay();
+  closeModal('profile-modal-overlay');
+  toast('Profile updated ✓');
 }
 
 $('btn-google-signin').onclick = async () => {
@@ -393,10 +527,18 @@ function navigate(view, extra = {}) {
     renderLabelView();
   }
 
-  document.querySelector('.topbar-title')?.remove();
   const tb = $('topbar');
-  const titleEl = el('span', 'topbar-title', escapeHtml(title));
-  tb.insertBefore(titleEl, tb.children[1]);
+  const existingTitle = tb.querySelector('.topbar-title');
+  if (existingTitle) {
+    existingTitle.textContent = title;
+  } else {
+    const titleEl = el('span', 'topbar-title', escapeHtml(title));
+    if (tb.children.length > 1) {
+      tb.insertBefore(titleEl, tb.children[1]);
+    } else {
+      tb.appendChild(titleEl);
+    }
+  }
 
   if (view === 'calendar')     renderCalendar();
   if (view === 'notes')        renderNotesList();
@@ -410,7 +552,61 @@ document.querySelectorAll('[data-view]').forEach(item => {
   item.onkeydown= e => e.key === 'Enter' && navigate(item.dataset.view);
 });
 
-$('sidebar-toggle').onclick  = () => $('sidebar').classList.toggle('collapsed');
+// ─── SIDEBAR (initSidebar) ────────────────────────────────────────────────────
+// All sidebar toggle, persistence, keyboard shortcut, and responsive logic
+// is encapsulated here. Call once after the DOM is ready.
+function initSidebar() {
+  const sidebar      = $('sidebar');
+  const toggleBtn    = $('sidebar-toggle');
+  const STORAGE_KEY  = 'sidebar_collapsed';
+
+  if (!sidebar || !toggleBtn) return;
+
+  /** Apply collapsed state to DOM and persist preference */
+  function applyCollapsed(collapsed, persist = true) {
+    sidebar.classList.toggle('collapsed', collapsed);
+    toggleBtn.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+    toggleBtn.title = collapsed ? 'Expand sidebar' : 'Collapse sidebar';
+    if (persist) localStorage.setItem(STORAGE_KEY, collapsed ? 'true' : 'false');
+  }
+
+  /** Toggle and flip current state */
+  function toggleSidebar() {
+    applyCollapsed(!sidebar.classList.contains('collapsed'));
+  }
+
+  // Restore saved state on load
+  const savedCollapsed = localStorage.getItem(STORAGE_KEY) === 'true';
+  applyCollapsed(savedCollapsed, false);
+
+  // Toggle button click
+  toggleBtn.addEventListener('click', toggleSidebar);
+
+  // Ctrl+B / Cmd+B keyboard shortcut
+  document.addEventListener('keydown', e => {
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'b') {
+      // Only fire when no text input is focused
+      const tag = document.activeElement?.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || document.activeElement?.isContentEditable) return;
+      e.preventDefault();
+      toggleSidebar();
+    }
+  });
+
+  // Mobile: responsive listener — remove collapsed on mobile (off-canvas takes over)
+  const mobileQuery = window.matchMedia('(max-width: 767px)');
+  function onMobileChange(mq) {
+    if (!mq.matches) {
+      // Back to desktop: restore saved preference
+      applyCollapsed(localStorage.getItem(STORAGE_KEY) === 'true', false);
+    }
+  }
+  mobileQuery.addEventListener('change', onMobileChange);
+}
+
+// Mobile sidebar open/close (separate from desktop collapse)
+$('mobile-menu-btn').onclick = () => $('sidebar').classList.toggle('mobile-open');
+
 $('btn-focus-mode').onclick  = () => {
   document.body.classList.toggle('focus-mode');
   toast(document.body.classList.contains('focus-mode') ? 'Focus mode on — press F to exit' : 'Focus mode off');
@@ -1168,16 +1364,22 @@ function noteAutoSave() {
     const title   = $('note-title-input').value.trim() || 'Untitled';
     const content = $('note-editor').innerHTML;
     const updatedAt = Date.now();
-    await fbUpdateNote(state.selectedNoteId, { title, content, updatedAt });
+    // Optimistically update local state first so the sidebar preview is immediate.
     const note = state.notes.find(n => n.id === state.selectedNoteId);
     if (note) {
       note.title     = title;
       note.content   = content;
       note.updatedAt = updatedAt;
-      // Sync sidebar list preview immediately after mutating local state.
       renderNotesList();
     }
-    $('note-save-status').textContent = 'Saved';
+    try {
+      await fbUpdateNote(state.selectedNoteId, { title, content, updatedAt });
+      $('note-save-status').textContent = 'Saved';
+    } catch (err) {
+      console.error('[Flow] Note save failed:', err);
+      $('note-save-status').textContent = 'Save failed';
+      toast('Could not save note. Check your connection.');
+    }
   }, 1000);
 }
 
@@ -1388,17 +1590,17 @@ document.addEventListener('keydown', e => {
 });
 
 // ─── MOBILE ───────────────────────────────────────────────────────────────────
-$('mobile-menu-btn').onclick = () => $('sidebar').classList.toggle('mobile-open');
+// (mobile-menu-btn click is wired inside initSidebar's section above)
 window.addEventListener('resize', () => {
-  $('mobile-menu-btn').style.display = window.innerWidth < 768 ? 'flex' : 'none';
+  const isMobile = window.innerWidth < 768;
+  $('mobile-menu-btn').style.display = isMobile ? 'flex' : 'none';
+  if (!isMobile) {
+    $('sidebar').classList.remove('mobile-open');
+    $('detail-panel')?.classList.remove('mobile-full');
+  }
 });
 
-document.querySelectorAll('[data-view]').forEach(item => {
-  item.addEventListener('click', () => {
-    if (window.innerWidth < 768) $('sidebar').classList.remove('mobile-open');
-  });
-});
-
+// Close mobile sidebar when backdrop or outside area is clicked
 document.addEventListener('click', e => {
   if (window.innerWidth < 768 &&
       $('sidebar').classList.contains('mobile-open') &&
@@ -1406,6 +1608,13 @@ document.addEventListener('click', e => {
       !e.target.closest('#mobile-menu-btn')) {
     $('sidebar').classList.remove('mobile-open');
   }
+});
+
+// Close mobile sidebar on nav item click (navigation handled by existing listeners)
+document.querySelectorAll('[data-view]').forEach(item => {
+  item.addEventListener('click', () => {
+    if (window.innerWidth < 768) $('sidebar').classList.remove('mobile-open');
+  });
 });
 
 // ─── INIT ─────────────────────────────────────────────────────────────────────
@@ -1449,6 +1658,9 @@ async function init() {
   }
 
   $('mobile-menu-btn').style.display = window.innerWidth < 768 ? 'flex' : 'none';
+
+  // Initialize encapsulated sidebar module
+  initSidebar();
 
   const tb = $('topbar');
   if (!tb.querySelector('.topbar-title')) {
