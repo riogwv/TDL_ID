@@ -528,15 +528,20 @@ function navigate(view, extra = {}) {
   }
 
   const tb = $('topbar');
-  const existingTitle = tb.querySelector('.topbar-title');
-  if (existingTitle) {
-    existingTitle.textContent = title;
-  } else {
-    const titleEl = el('span', 'topbar-title', escapeHtml(title));
-    if (tb.children.length > 1) {
-      tb.insertBefore(titleEl, tb.children[1]);
+  if (tb) {
+    const existingTitle = tb.querySelector('.topbar-title');
+    if (existingTitle) {
+      existingTitle.textContent = title;
     } else {
-      tb.appendChild(titleEl);
+      const titleEl   = el('span', 'topbar-title', escapeHtml(title));
+      const searchBar = $('search-bar');
+      if (searchBar && searchBar.parentNode === tb) {
+        tb.insertBefore(titleEl, searchBar);
+      } else if (tb.children.length > 1) {
+        tb.insertBefore(titleEl, tb.children[1]);
+      } else {
+        tb.appendChild(titleEl);
+      }
     }
   }
 
@@ -593,19 +598,37 @@ function initSidebar() {
     }
   });
 
-  // Mobile: responsive listener — remove collapsed on mobile (off-canvas takes over)
+  // Responsive: when switching from mobile → desktop, restore saved preference
   const mobileQuery = window.matchMedia('(max-width: 767px)');
-  function onMobileChange(mq) {
-    if (!mq.matches) {
-      // Back to desktop: restore saved preference
-      applyCollapsed(localStorage.getItem(STORAGE_KEY) === 'true', false);
-    }
-  }
-  mobileQuery.addEventListener('change', onMobileChange);
+  mobileQuery.addEventListener('change', mq => {
+    if (!mq.matches) applyCollapsed(localStorage.getItem(STORAGE_KEY) === 'true', false);
+  });
+
+  // Tooltip positioning: set --tip-top so the fixed ::after appears at the right Y
+  // (sidebar overflow-x:hidden clips absolute children; fixed escapes that)
+  sidebar.addEventListener('mouseover', e => {
+    const item = e.target.closest('.nav-item[aria-label]');
+    if (!item || !sidebar.classList.contains('collapsed')) return;
+    const rect = item.getBoundingClientRect();
+    item.style.setProperty('--tip-top', `${rect.top + rect.height / 2}px`);
+  });
 }
 
 // Mobile sidebar open/close (separate from desktop collapse)
-$('mobile-menu-btn').onclick = () => $('sidebar').classList.toggle('mobile-open');
+function openMobileSidebar() {
+  $('sidebar').classList.add('mobile-open');
+  $('sidebar-backdrop').classList.add('visible');
+  $('mobile-menu-btn').setAttribute('aria-expanded', 'true');
+}
+function closeMobileSidebar() {
+  $('sidebar').classList.remove('mobile-open');
+  $('sidebar-backdrop').classList.remove('visible');
+  $('mobile-menu-btn').setAttribute('aria-expanded', 'false');
+}
+$('mobile-menu-btn').onclick = () => {
+  $('sidebar').classList.contains('mobile-open') ? closeMobileSidebar() : openMobileSidebar();
+};
+$('sidebar-backdrop').onclick = closeMobileSidebar;
 
 $('btn-focus-mode').onclick  = () => {
   document.body.classList.toggle('focus-mode');
@@ -1553,9 +1576,21 @@ function clearSearch() {
 function openModal(id) {
   const overlay = $(id);
   overlay.classList.add('open');
+  // Lock body scroll so background content doesn't scroll behind modal on mobile
+  document.body.classList.add('modal-open');
+  // Hide app from screen readers while modal is open
+  $('app')?.setAttribute('aria-hidden', 'true');
   overlay.onclick = e => { if (e.target === overlay) closeModal(id); };
 }
-function closeModal(id) { $(id).classList.remove('open'); }
+function closeModal(id) {
+  $(id).classList.remove('open');
+  // Only unlock scroll if no other modals are still open
+  const anyOpen = document.querySelector('.modal-overlay.open');
+  if (!anyOpen) {
+    document.body.classList.remove('modal-open');
+    $('app')?.removeAttribute('aria-hidden');
+  }
+}
 
 // ─── KEYBOARD SHORTCUTS ───────────────────────────────────────────────────────
 let gKeyPending = false;
@@ -1566,6 +1601,7 @@ document.addEventListener('keydown', e => {
     closeModal('task-modal-overlay');
     closeModal('project-modal-overlay');
     closeModal('label-modal-overlay');
+    closeModal('profile-modal-overlay');
     closeDetail();
     $('search-results').classList.remove('visible');
     return;
@@ -1590,30 +1626,17 @@ document.addEventListener('keydown', e => {
 });
 
 // ─── MOBILE ───────────────────────────────────────────────────────────────────
-// (mobile-menu-btn click is wired inside initSidebar's section above)
 window.addEventListener('resize', () => {
-  const isMobile = window.innerWidth < 768;
-  $('mobile-menu-btn').style.display = isMobile ? 'flex' : 'none';
-  if (!isMobile) {
-    $('sidebar').classList.remove('mobile-open');
+  if (window.innerWidth >= 768) {
+    closeMobileSidebar();
     $('detail-panel')?.classList.remove('mobile-full');
   }
 });
 
-// Close mobile sidebar when backdrop or outside area is clicked
-document.addEventListener('click', e => {
-  if (window.innerWidth < 768 &&
-      $('sidebar').classList.contains('mobile-open') &&
-      !e.target.closest('#sidebar') &&
-      !e.target.closest('#mobile-menu-btn')) {
-    $('sidebar').classList.remove('mobile-open');
-  }
-});
-
-// Close mobile sidebar on nav item click (navigation handled by existing listeners)
+// Close mobile sidebar on nav item click
 document.querySelectorAll('[data-view]').forEach(item => {
   item.addEventListener('click', () => {
-    if (window.innerWidth < 768) $('sidebar').classList.remove('mobile-open');
+    if (window.innerWidth < 768) closeMobileSidebar();
   });
 });
 
@@ -1657,14 +1680,21 @@ async function init() {
     showAuth();
   }
 
-  $('mobile-menu-btn').style.display = window.innerWidth < 768 ? 'flex' : 'none';
-
-  // Initialize encapsulated sidebar module
+  // Initialize encapsulated sidebar module (desktop collapse + Ctrl+B + localStorage)
   initSidebar();
 
+  // Insert topbar page-title span before the search bar (idempotent).
   const tb = $('topbar');
-  if (!tb.querySelector('.topbar-title')) {
-    tb.insertBefore(el('span', 'topbar-title', 'Inbox'), tb.children[1]);
+  if (tb && !tb.querySelector('.topbar-title')) {
+    const searchBar = $('search-bar');
+    const titleEl   = el('span', 'topbar-title', 'Inbox');
+    if (searchBar && searchBar.parentNode === tb) {
+      tb.insertBefore(titleEl, searchBar);
+    } else if (tb.children.length > 1) {
+      tb.insertBefore(titleEl, tb.children[1]);
+    } else {
+      tb.appendChild(titleEl);
+    }
   }
 
   updatePomodoroDisplay();
