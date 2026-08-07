@@ -387,14 +387,19 @@ async function saveProfile() {
     DB.save();
   } else if (isFirebaseReady() && state.user) {
     const { db, doc, setDoc, serverTimestamp } = window._fb;
-    try {
-      // updateProfile for display name / photo
+try {
+      // updateProfile for display name / photo (hanya kirim photoURL ke Auth jika BUKAN Base64 panjang)
       const { updateProfile } = await import('https://www.gstatic.com/firebasejs/10.8.0/firebase-auth.js');
+      
+      const isBase64 = photoURL && photoURL.startsWith('data:image/');
+      const authPhoto = (photoURL && !isBase64 && photoURL.length < 2000) ? photoURL : undefined;
+
       await updateProfile(state.user, {
         displayName: displayName || undefined,
-        photoURL:    photoURL    || undefined
+        photoURL: authPhoto
       });
-      // Also persist full profile (including bio) to Firestore
+
+      // Also persist full profile (including bio & Base64 photo) to Firestore
       await setDoc(doc(db, 'profiles', state.user.uid), {
         displayName, photoURL, bio, updatedAt: serverTimestamp()
       }, { merge: true });
