@@ -1393,7 +1393,9 @@ body.focus-mode #main   { height: 100vh; }
   .color-option      { width: 28px; height: 28px; }
   .accent-dot        { width: 32px; height: 32px; }
   .priority-btn      { padding: 10px 14px; min-height: 44px; }
-  .task-checkbox     { width: 24px; height: 24px; margin-top: 0; }
+  /* Task actions: always visible on touch — :hover doesn't fire on mobile */
+  .task-actions { display: flex; }
+  .task-item:hover .task-actions { display: flex; } /* keep desktop rule consistent */
   .toggle            { width: 44px; height: 26px; border-radius: 13px; }
   .toggle::after     { width: 20px; height: 20px; top: 3px; left: 3px; }
   .toggle.on::after  { transform: translateX(18px); }
