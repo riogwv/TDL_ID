@@ -1,12 +1,23 @@
 'use strict';
 
+// ─── DEFAULTS ─────────────────────────────────────────────────────────────────
+const DEFAULT_PROJECTS = [
+  { id: 'inbox', name: 'Inbox', color: '#DC4C3E' },
+  { id: 'work', name: 'Work', color: '#146FF8' },
+  { id: 'personal', name: 'Personal', color: '#418014' }
+];
+const DEFAULT_LABELS = [
+  { id: 'urgent', name: 'urgent', color: '#DC4C3E' },
+  { id: 'focus', name: 'focus', color: '#146FF8' }
+];
+
 // ─── STATE ────────────────────────────────────────────────────────────────────
 const state = {
   user: null,
   profile: { displayName: '', bio: '', photoURL: '' },
   tasks: [],
-  projects: [],
-  labels: [],
+  projects: DEFAULT_PROJECTS,
+  labels: DEFAULT_LABELS,
   notes: [],
   currentView: 'inbox',
   currentProjectId: null,
@@ -86,6 +97,7 @@ function isOverdue(dateStr) {
 }
 function toDateStr(d) { return d.toISOString().split('T')[0]; }
 function uid()        { return Date.now().toString(36) + Math.random().toString(36).slice(2); }
+function tsVal(v)     { return typeof v?.toMillis === 'function' ? v.toMillis() : (v || 0); }
 
 function escapeHtml(str) {
   return String(str ?? '')
@@ -106,8 +118,8 @@ const DB = {
     try {
       const d = JSON.parse(localStorage.getItem('flow_data') || '{}');
       state.tasks    = d.tasks    || [];
-      state.projects = d.projects || [];
-      state.labels   = d.labels   || [];
+      state.projects = d.projects ?? DEFAULT_PROJECTS;
+      state.labels   = d.labels ?? DEFAULT_LABELS;
       state.notes    = d.notes    || [];
       state.settings = { ...state.settings, ...(d.settings || {}) };
       state.profile  = { ...state.profile,  ...(d.profile  || {}) };
@@ -161,7 +173,10 @@ function initFirebase() {
       if (user) {
         state.demoMode = false;
         state.user = user;
-        // Load persisted profile from Firestore if available.
+        // Show the app immediately; hydrate the profile in parallel so a slow
+        // Firestore read doesn't block the login.
+        showApp(user);
+        subscribeFirestore(user.uid);
         try {
           const { db, doc, getDoc } = window._fb;
           const snap = await getDoc(doc(db, 'profiles', user.uid));
@@ -172,10 +187,9 @@ function initFirebase() {
               photoURL:    d.photoURL    || '',
               bio:         d.bio         || ''
             };
+            refreshUserDisplay();
           }
         } catch (_) { /* non-fatal */ }
-        showApp(user);
-        subscribeFirestore(user.uid);
       } else {
         showAuth();
       }
@@ -190,10 +204,16 @@ function initFirebase() {
 function subscribeFirestore(uid) {
   const { db, collection, query, where, onSnapshot } = window._fb;
   const colKeys = { tasks:'tasks', projects:'projects', labels:'labels', notes:'notes' };
+  const fallbacks = { projects: DEFAULT_PROJECTS, labels: DEFAULT_LABELS };
   state.unsubscribers = Object.keys(colKeys).map(col =>
     onSnapshot(
       query(collection(db, col), where('uid','==', uid)),
-      snap => { state[colKeys[col]] = snap.docs.map(d => ({ id: d.id, ...d.data() })); renderAll(); },
+      snap => {
+        // Canonical Firestore doc id must win over any legacy stored `id` field.
+        const items = snap.docs.map(d => ({ ...d.data(), id: d.id }));
+        state[colKeys[col]] = items.length ? items : (fallbacks[colKeys[col]] || []);
+        renderAll();
+      },
       err  => console.error('[Flow] Firestore error:', err)
     )
   );
@@ -206,7 +226,10 @@ async function fbAdd(col, data) {
     DB.save(); renderAll(); return data.id;
   }
   const { db, collection, addDoc, serverTimestamp } = window._fb;
-  const ref = await addDoc(collection(db, col), { ...data, uid: state.user.uid, createdAt: serverTimestamp() });
+  // Firestore owns the document id; discard the client-generated id so the
+  // snapshot's canonical `id` (d.id) stays in sync with the doc path.
+  const { id, ...rest } = data;
+  const ref = await addDoc(collection(db, col), { ...rest, uid: state.user.uid, createdAt: serverTimestamp() });
   return ref.id;
 }
 async function fbUpdate(col, id, data) {
@@ -272,19 +295,44 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   // File upload for profile picture
-  $('profile-photo-upload')?.addEventListener('change', e => {
+  $('profile-photo-upload')?.addEventListener('change', async e => {
     const file = e.target.files?.[0];
     if (!file) return;
     if (!file.type.startsWith('image/')) { toast('Please select an image file'); return; }
-    const reader = new FileReader();
-    reader.onload = ev => {
-      const dataUrl = ev.target.result;
-      const photoInput = $('profile-photo-input');
-      if (photoInput) photoInput.value = dataUrl;
-      const prev = $('profile-photo-preview');
-      if (prev) { prev.src = dataUrl; prev.style.display = 'block'; }
-    };
-    reader.readAsDataURL(file);
+    const photoInput = $('profile-photo-input');
+    const prev = $('profile-photo-preview');
+    if (state.demoMode || !isFirebaseReady() || !state.user) {
+      // Demo/local mode: keep the Base64 data URL (localStorage can hold it).
+      const reader = new FileReader();
+      reader.onload = ev => {
+        const dataUrl = ev.target.result;
+        if (photoInput) photoInput.value = dataUrl;
+        if (prev) { prev.src = dataUrl; prev.style.display = 'block'; }
+      };
+      reader.readAsDataURL(file);
+      return;
+    }
+    // Firestore mode: upload to Storage and persist the download URL so the
+    // avatar survives refresh/login (Base64 would exceed Firestore's 1 MiB limit).
+    try {
+      const { storage, ref, uploadBytes, getDownloadURL } = window._fb;
+      const safeName = file.name.replace(/[^a-zA-Z0-9._-]/g, '_');
+      const path = `profile-photos/${state.user.uid}/${Date.now()}-${safeName}`;
+      const snap = await uploadBytes(ref(storage, path), file);
+      const url  = await getDownloadURL(snap.ref);
+      if (photoInput) photoInput.value = url;
+      if (prev) { prev.src = url; prev.style.display = 'block'; }
+      toast('Photo uploaded ✓');
+    } catch (err) {
+      console.error('[Flow] Photo upload failed:', err);
+      toast('Photo upload failed');
+    }
+  });
+
+  // Bio character counter
+  $('profile-bio-input')?.addEventListener('input', () => {
+    const c = $('profile-bio-chars');
+    if (c) c.textContent = $('profile-bio-input').value.length;
   });
 });
 
@@ -722,6 +770,7 @@ function bindColorPicker(pickerId, stateKey) {
 // ─── TASK MODAL ───────────────────────────────────────────────────────────────
 function openTaskModal(task = null) {
   state.editingTaskId = task?.id || null;
+  state.taskModal.saving = false;
   const isEdit = !!task;
   $('task-modal-title').textContent  = isEdit ? 'Edit task'    : 'Add task';
   $('task-modal-save').textContent   = isEdit ? 'Save changes' : 'Add task';
@@ -787,6 +836,10 @@ $('task-modal-cancel').onclick = () => closeModal('task-modal-overlay');
 $('task-modal-save').onclick = async () => {
   const title = $('task-title-input').value.trim();
   if (!title) { toast('Enter a task title'); $('task-title-input').focus(); return; }
+  if (state.taskModal.saving) return;
+  state.taskModal.saving = true;
+  const saveBtn = $('task-modal-save');
+  if (saveBtn) saveBtn.disabled = true;
 
   const taskData = {
     title,
@@ -796,24 +849,33 @@ $('task-modal-save').onclick = async () => {
     priority:  state.taskModal.priority,
     projectId: $('task-project-input').value,
     labelId:   $('task-label-input').value,
-    recurring: $('task-recurring-input').value,
-    done: false,
-    subtasks: []
+    recurring: $('task-recurring-input').value
   };
 
-  if (state.editingTaskId) {
-    await fbUpdateTask(state.editingTaskId, taskData);
-    toast('Task updated');
-  } else {
-    const task = { ...taskData, id: uid(), createdAt: Date.now() };
-    await fbAddTask(task);
-    if (state.currentView === 'today' && !taskData.dueDate) {
-      await fbUpdateTask(task.id, { dueDate: toDateStr(new Date()) });
+  try {
+    if (state.editingTaskId) {
+      const existing = state.tasks.find(t => t.id === state.editingTaskId);
+      // Preserve completion status and subtasks when editing.
+      await fbUpdateTask(state.editingTaskId, {
+        ...taskData,
+        done: existing?.done ?? false,
+        subtasks: existing?.subtasks ?? []
+      });
+      toast('Task updated');
+    } else {
+      const task = { ...taskData, id: uid(), createdAt: Date.now(), done: false, subtasks: [] };
+      const taskId = await fbAddTask(task);
+      if (state.currentView === 'today' && !taskData.dueDate) {
+        await fbUpdateTask(taskId, { dueDate: toDateStr(new Date()) });
+      }
+      toast('Task added');
     }
-    toast('Task added');
+    closeModal('task-modal-overlay');
+    renderAll();
+  } finally {
+    state.taskModal.saving = false;
+    if (saveBtn) saveBtn.disabled = false;
   }
-  closeModal('task-modal-overlay');
-  renderAll();
 };
 
 // ─── TASK RENDERING ───────────────────────────────────────────────────────────
@@ -828,7 +890,7 @@ function sortTasks(tasks) {
       return a.dueDate < b.dueDate ? -1 : 1;
     }
     if (s === 'alpha') return a.title.localeCompare(b.title);
-    return (b.createdAt || 0) - (a.createdAt || 0);
+    return tsVal(b.createdAt) - tsVal(a.createdAt);
   });
 }
 
@@ -1368,8 +1430,8 @@ function openNote(id) {
 
 $('btn-add-note').onclick = async () => {
   const note = { id: uid(), title: 'Untitled note', content: '', updatedAt: Date.now() };
-  await fbAddNote(note);
-  openNote(note.id);
+  const noteId = await fbAddNote(note);
+  openNote(noteId);
 };
 
 $('btn-delete-note').onclick = async () => {

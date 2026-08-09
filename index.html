@@ -716,6 +716,9 @@
     onSnapshot, addDoc, updateDoc, deleteDoc,
     doc, setDoc, getDoc, serverTimestamp
   } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore.js";
+  import {
+    getStorage, ref, uploadBytes, getDownloadURL
+  } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-storage.js";
 
   const firebaseConfig = {
     apiKey: "AIzaSyA6w6LgPNADAbQOw9Xx2fcWjLZXLNXF1xY",
@@ -733,13 +736,16 @@
     const db       = getFirestore(app);
     const provider = new GoogleAuthProvider();
 
+    const storage = getStorage(app);
+
     window._fb = {
-      auth, db, provider,
+      auth, db, provider, storage,
       signInWithPopup, signInWithEmailAndPassword,
       createUserWithEmailAndPassword, signOut, onAuthStateChanged,
       collection, query, where, orderBy,
       onSnapshot, addDoc, updateDoc, deleteDoc,
-      doc, setDoc, getDoc, serverTimestamp
+      doc, setDoc, getDoc, serverTimestamp,
+      ref, uploadBytes, getDownloadURL
     };
     console.log('[Flow] Firebase initialized successfully.');
     window._fbResolve(window._fb);
