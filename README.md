@@ -238,4 +238,4 @@ If you intend to use or adapt this code, please contact the repository owner fir
 
 ---
 
-Built by [riogwv](https://www.google.com/search?q=https://github.com/riogwv) · Hosted on [GitHub Pages](https://riogwv.github.io/TDL_ID/)
+Built by [riogwv](https://github.com/riogwv) · Hosted on [GitHub Pages](https://riogwv.github.io/TDL_ID/)
