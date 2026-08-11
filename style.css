@@ -1518,6 +1518,19 @@ body.focus-mode #main   { height: 100vh; }
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
+   CONFIRM MODAL
+═══════════════════════════════════════════════════════════════════════════ */
+#confirm-modal { max-width: 360px; }
+
+/* Import confirmation button — override danger style to primary */
+#confirm-modal-ok.import-action {
+  background: var(--primary);
+  color: #fff;
+  border-color: var(--primary);
+}
+#confirm-modal-ok.import-action:hover { background: var(--primary-hover); }
+
+/* ═══════════════════════════════════════════════════════════════════════════
    PRINT
 ═══════════════════════════════════════════════════════════════════════════ */
 @media print {

@@ -7,6 +7,10 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="style.css">
+  <link rel="manifest" href="manifest.json">
+  <meta name="theme-color" content="#DC4C3E">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
 
 
 </head>
@@ -153,7 +157,7 @@
 
       <div id="search-bar" role="search">
         <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="color:var(--text-muted);flex-shrink:0" aria-hidden="true"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
-        <input type="search" id="search-input" placeholder="Search tasks, notes… (⌘K)" aria-label="Search" autocomplete="off">
+        <input type="search" id="search-input" placeholder="Search tasks, notes… (⌘K) — try p:1 #label @project" aria-label="Search" autocomplete="off">
         <span class="kbd" aria-hidden="true">⌘K</span>
       </div>
 
@@ -318,6 +322,7 @@
               <button class="note-tool-btn" data-cmd="link"      title="Insert link">🔗</button>
               <div class="toolbar-end">
                 <span id="note-save-status" aria-live="polite">Saved</span>
+                <button class="btn btn-ghost btn-sm" id="btn-export-note" title="Export as Markdown">⬇ MD</button>
                 <button class="btn btn-ghost btn-sm" id="btn-delete-note">Delete</button>
               </div>
             </div>
@@ -360,6 +365,28 @@
             <button class="btn btn-secondary btn-sm" id="pomodoro-skip">Skip</button>
           </div>
           <div style="margin-top:12px;font-size:12px;color:var(--text-muted)">Session <span id="pomodoro-session">1</span> of 4</div>
+          <details id="pomodoro-settings" style="margin-top:14px;font-size:12px;color:var(--text-secondary)">
+            <summary style="cursor:pointer;user-select:none;list-style:none;font-weight:500">&#9881; Settings</summary>
+            <div style="margin-top:10px;display:flex;flex-direction:column;gap:8px">
+              <label style="display:flex;align-items:center;justify-content:space-between;gap:8px">
+                Focus (min)
+                <input type="number" id="pomo-focus-input" min="1" max="120" value="25" class="form-input" style="width:60px;padding:3px 6px;text-align:right">
+              </label>
+              <label style="display:flex;align-items:center;justify-content:space-between;gap:8px">
+                Short break (min)
+                <input type="number" id="pomo-short-input" min="1" max="60" value="5" class="form-input" style="width:60px;padding:3px 6px;text-align:right">
+              </label>
+              <label style="display:flex;align-items:center;justify-content:space-between;gap:8px">
+                Long break (min)
+                <input type="number" id="pomo-long-input" min="1" max="120" value="15" class="form-input" style="width:60px;padding:3px 6px;text-align:right">
+              </label>
+              <label style="display:flex;align-items:center;justify-content:space-between;gap:8px">
+                Sound alert
+                <div class="toggle" id="pomo-sound-toggle" role="switch" aria-label="Sound alert" aria-checked="true" tabindex="0"></div>
+              </label>
+              <button class="btn btn-secondary btn-sm" id="pomo-apply-btn" style="width:100%;margin-top:4px">Apply &amp; Reset</button>
+            </div>
+          </details>
         </div>
 
         <!-- Week chart -->
@@ -447,6 +474,27 @@
               <option value="12h">12-hour</option>
               <option value="24h">24-hour</option>
             </select>
+          </div>
+        </div>
+
+        <div class="settings-section">
+          <div class="settings-section-title">Data</div>
+          <div class="settings-row">
+            <div>
+              <div class="settings-row-label">Export data</div>
+              <div class="settings-row-desc">Download all tasks, notes, and projects as JSON</div>
+            </div>
+            <button class="btn btn-secondary btn-sm" id="btn-export-data">Export JSON</button>
+          </div>
+          <div class="settings-row">
+            <div>
+              <div class="settings-row-label">Import data</div>
+              <div class="settings-row-desc">Restore from a previously exported JSON file</div>
+            </div>
+            <label class="btn btn-secondary btn-sm" style="cursor:pointer;display:inline-flex;align-items:center">
+              Import JSON
+              <input type="file" id="import-data-input" accept=".json,application/json" style="display:none">
+            </label>
           </div>
         </div>
 
@@ -694,6 +742,25 @@
 <!-- Mobile sidebar backdrop -->
 <div id="sidebar-backdrop" aria-hidden="true"></div>
 
+<!-- ════════════════════ CONFIRM DELETE MODAL ════════════════════ -->
+<div class="modal-overlay" id="confirm-modal-overlay" role="dialog" aria-modal="true" aria-labelledby="confirm-modal-title">
+  <div class="modal" id="confirm-modal" style="max-width:360px">
+    <div class="modal-header">
+      <h2 id="confirm-modal-title">Delete</h2>
+      <button class="icon-btn" id="confirm-modal-close" aria-label="Close">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" aria-hidden="true"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+      </button>
+    </div>
+    <div class="modal-body">
+      <p id="confirm-modal-message" style="font-size:14px;line-height:1.6;color:var(--text-secondary)"></p>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-ghost" id="confirm-modal-cancel">Cancel</button>
+      <button class="btn btn-danger" id="confirm-modal-ok" style="border:1px solid #fca5a5">Delete</button>
+    </div>
+  </div>
+</div>
+
 <!-- Promise bridge: lets classic app.js await the ES module's Firebase init -->
 <script>
   window._fb = null;
@@ -757,5 +824,15 @@
 
 <!-- app.js is at end of body — no defer needed; DOM is already fully parsed -->
 <script src="app.js"></script>
+<script>
+  // Register service worker for offline shell caching.
+  if ('serviceWorker' in navigator) {
+    window.addEventListener('load', () => {
+      navigator.serviceWorker.register('./sw.js').catch(err => {
+        console.warn('[Flow] SW registration failed:', err);
+      });
+    });
+  }
+</script>
 </body>
 </html>

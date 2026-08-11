@@ -47,7 +47,8 @@ const state = {
     mode: 'work',
     remaining: 25 * 60,
     running: false,
-    timer: null
+    timer: null,
+    sound: true          // persist with settings below
   },
   demoMode: false,
   unsubscribers: []
@@ -229,8 +230,13 @@ async function fbAdd(col, data) {
   // Firestore owns the document id; discard the client-generated id so the
   // snapshot's canonical `id` (d.id) stays in sync with the doc path.
   const { id, ...rest } = data;
-  const ref = await addDoc(collection(db, col), { ...rest, uid: state.user.uid, createdAt: serverTimestamp() });
-  return ref.id;
+  try {
+    const ref = await addDoc(collection(db, col), { ...rest, uid: state.user.uid, createdAt: serverTimestamp() });
+    return ref.id;
+  } catch (err) {
+    console.error('[Flow] Firestore add failed:', err);
+    toast('Could not save — check your connection.');
+  }
 }
 async function fbUpdate(col, id, data) {
   if (state.demoMode) {
@@ -239,7 +245,12 @@ async function fbUpdate(col, id, data) {
     DB.save(); renderAll(); return;
   }
   const { db, doc, updateDoc } = window._fb;
-  await updateDoc(doc(db, col, id), data);
+  try {
+    await updateDoc(doc(db, col, id), data);
+  } catch (err) {
+    console.error('[Flow] Firestore update failed:', err);
+    toast('Could not save — check your connection.');
+  }
 }
 async function fbDelete(col, id) {
   if (state.demoMode) {
@@ -247,7 +258,12 @@ async function fbDelete(col, id) {
     DB.save(); renderAll(); return;
   }
   const { db, doc, deleteDoc } = window._fb;
-  await deleteDoc(doc(db, col, id));
+  try {
+    await deleteDoc(doc(db, col, id));
+  } catch (err) {
+    console.error('[Flow] Firestore delete failed:', err);
+    toast('Could not delete — check your connection.');
+  }
 }
 
 // Semantic wrappers
@@ -302,12 +318,29 @@ document.addEventListener('DOMContentLoaded', () => {
     const photoInput = $('profile-photo-input');
     const prev = $('profile-photo-preview');
     if (state.demoMode || !isFirebaseReady() || !state.user) {
-      // Demo/local mode: keep the Base64 data URL (localStorage can hold it).
+      // Demo/local mode: resize+compress via Canvas before storing as Base64.
+      // Target: ≤200px, JPEG quality 0.82 — keeps localStorage impact small.
+      const MAX_DIM = 200;
+      const MAX_BYTES = 100 * 1024; // 100 KB safety ceiling
       const reader = new FileReader();
       reader.onload = ev => {
-        const dataUrl = ev.target.result;
-        if (photoInput) photoInput.value = dataUrl;
-        if (prev) { prev.src = dataUrl; prev.style.display = 'block'; }
+        const img = new Image();
+        img.onload = () => {
+          const scale  = Math.min(1, MAX_DIM / Math.max(img.width, img.height));
+          const w      = Math.round(img.width  * scale);
+          const h      = Math.round(img.height * scale);
+          const canvas = document.createElement('canvas');
+          canvas.width = w; canvas.height = h;
+          canvas.getContext('2d').drawImage(img, 0, 0, w, h);
+          const dataUrl = canvas.toDataURL('image/jpeg', 0.82);
+          if (dataUrl.length > MAX_BYTES * 1.4) { // base64 overhead ~37%
+            toast('Image too large after compression. Please use a smaller file.');
+            return;
+          }
+          if (photoInput) photoInput.value = dataUrl;
+          if (prev) { prev.src = dataUrl; prev.style.display = 'block'; }
+        };
+        img.src = ev.target.result;
       };
       reader.readAsDataURL(file);
       return;
@@ -894,10 +927,12 @@ function sortTasks(tasks) {
   });
 }
 
+// emptyMsg format: 'Title||description||icon' — icon and desc are optional
 function renderTaskList(container, tasks, emptyMsg = 'No tasks here') {
   if (!container) return;
   if (!tasks.length) {
-    container.innerHTML = `<div class="empty-state"><div class="empty-icon" aria-hidden="true">✓</div><div class="empty-title">${escapeHtml(emptyMsg)}</div><div class="empty-desc">You're all caught up.</div></div>`;
+    const [title, desc = "You're all caught up.", icon = '✓'] = emptyMsg.split('||');
+    container.innerHTML = `<div class="empty-state"><div class="empty-icon" aria-hidden="true">${icon}</div><div class="empty-title">${escapeHtml(title)}</div><div class="empty-desc">${escapeHtml(desc)}</div></div>`;
     return;
   }
   container.innerHTML = '';
@@ -988,14 +1023,34 @@ async function toggleTask(id) {
   const task = state.tasks.find(t => t.id === id);
   if (!task) return;
   const done = !task.done;
+
+  // Targeted checkbox update — avoids full re-render for a simple toggle.
   const cbEl = document.querySelector(`.task-item[data-id="${id}"] .task-checkbox`);
   if (cbEl) { cbEl.classList.toggle('checked', done); cbEl.setAttribute('aria-checked', String(done)); }
+
   if (done && task.recurring) {
-    await fbUpdateTask(id, { done: false, dueDate: getNextRecurring(task.dueDate, task.recurring) });
+    // Recurring: reschedule — state changes are structural, so a full render is needed.
+    task.done    = false;
+    task.dueDate = getNextRecurring(task.dueDate, task.recurring);
+    if (state.demoMode) { DB.save(); renderAll(); }
+    else                { await fbUpdateTask(id, { done: false, dueDate: task.dueDate }); }
     toast('Recurring task rescheduled');
     return;
   }
-  await fbUpdateTask(id, { done });
+
+  task.done = done;
+  if (state.demoMode) {
+    // Demo: persist + update counts only (no full re-render).
+    DB.save();
+    updateCounts();
+    // Also update the task item's visual class so it looks right in all views.
+    document.querySelectorAll(`.task-item[data-id="${id}"]`).forEach(el => {
+      el.classList.toggle('completed', done);
+    });
+  } else {
+    await fbUpdateTask(id, { done });
+    // Firestore: snapshot listener will call renderAll(); nothing more needed here.
+  }
   if (done) toast('Task completed ✓');
 }
 
@@ -1008,10 +1063,14 @@ function getNextRecurring(dateStr, recurring) {
   return toDateStr(d);
 }
 
-async function deleteTask(id) {
-  if (state.selectedTaskId === id) closeDetail();
-  await fbDeleteTask(id);
-  toast('Task deleted');
+function deleteTask(id) {
+  const task = state.tasks.find(t => t.id === id);
+  const name = task?.title ? `"${task.title}"` : 'this task';
+  confirmDelete(`Delete ${name}? This cannot be undone.`, async () => {
+    if (state.selectedTaskId === id) closeDetail();
+    await fbDeleteTask(id);
+    toast('Task deleted');
+  });
 }
 
 // ─── TASK DETAIL PANEL ────────────────────────────────────────────────────────
@@ -1129,7 +1188,7 @@ function openDetail(taskId) {
   const delBtn = el('button', 'btn btn-danger btn-sm');
   delBtn.innerHTML = `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/><path d="M9 6V4h6v2"/></svg> Delete task`;
   delBtn.style.marginTop = '16px';
-  delBtn.onclick = () => { deleteTask(task.id); closeDetail(); };
+  delBtn.onclick = () => { deleteTask(task.id); };
   body.appendChild(delBtn);
 
   document.querySelectorAll('.task-item').forEach(e => e.classList.toggle('selected', e.dataset.id === taskId));
@@ -1167,11 +1226,11 @@ function renderTaskViews() {
   const somedayTasks   = active.filter(t => !t.dueDate);
   const completedTasks = state.tasks.filter(t => t.done);
 
-  renderTaskList($('task-list-inbox'),     inboxTasks,                'Inbox is empty');
-  renderTaskList($('task-list-today'),     todayTasks,                'Nothing due today');
-  renderTaskList($('task-list-overdue'),   overdueTasks,              'No overdue tasks');
-  renderTaskList($('task-list-completed'), completedTasks.slice(0,50),'No completed tasks');
-  renderTaskList($('task-list-someday'),   somedayTasks,              'No tasks in Someday');
+  renderTaskList($('task-list-inbox'),     inboxTasks,                'Inbox is clear||Add a task above to get started.||📥');
+  renderTaskList($('task-list-today'),     todayTasks,                "Nothing due today||Enjoy the calm, or add something for today.||☀️");
+  renderTaskList($('task-list-overdue'),   overdueTasks,              "You're all caught up!||No overdue tasks. Keep it that way.||✅");
+  renderTaskList($('task-list-completed'), completedTasks.slice(0,50),'No completed tasks yet||Finish a task and it will show up here.||🏁');
+  renderTaskList($('task-list-someday'),   somedayTasks,              'Someday is empty||Park ideas here with no deadline. No pressure.||💭');
 
   const upcomingEl = $('task-list-upcoming');
   if (upcomingEl) {
@@ -1200,12 +1259,12 @@ function renderTaskViews() {
 function renderProjectView() {
   renderTaskList($('task-list-project'),
     state.tasks.filter(t => t.projectId === state.currentProjectId && !t.done),
-    'No tasks in this project');
+    'No tasks yet||Add your first task to this project above.||📁');
 }
 function renderLabelView() {
   renderTaskList($('task-list-label'),
     state.tasks.filter(t => t.labelId === state.currentLabelId && !t.done),
-    'No tasks with this label');
+    'Nothing here yet||Add a task and tag it with this label to see it here.||🏷️');
 }
 
 function updateCounts() {
@@ -1403,7 +1462,9 @@ function renderNotesList() {
     .sort((a,b) => (b.updatedAt||0) - (a.updatedAt||0));
   scroll.innerHTML = '';
   if (!notes.length) {
-    scroll.innerHTML = `<div style="padding:20px;text-align:center;color:var(--text-muted);font-size:13px">No notes found</div>`;
+    const msg = q ? `No notes matching "${escapeHtml(q)}"` : 'No notes yet';
+    const hint = q ? 'Try a different search term.' : 'Create a new note to capture your first idea.';
+    scroll.innerHTML = `<div style="padding:24px 16px;text-align:center;color:var(--text-muted);font-size:13px"><div style="font-size:28px;margin-bottom:8px;opacity:0.4">📝</div><div style="font-weight:600;color:var(--text-secondary);margin-bottom:4px">${msg}</div><div>${hint}</div></div>`;
     return;
   }
   notes.forEach(note => {
@@ -1417,6 +1478,8 @@ function renderNotesList() {
 }
 
 function openNote(id) {
+  // Flush any pending autosave for the current note before switching.
+  if (state.selectedNoteId && state.selectedNoteId !== id) noteSaveNow();
   state.selectedNoteId = id;
   const note = state.notes.find(n => n.id === id);
   if (!note) return;
@@ -1434,47 +1497,105 @@ $('btn-add-note').onclick = async () => {
   openNote(noteId);
 };
 
-$('btn-delete-note').onclick = async () => {
+/** Convert basic HTML from the note editor to Markdown text. */
+function noteHtmlToMarkdown(html) {
+  const div = document.createElement('div');
+  div.innerHTML = html;
+  function nodeToMd(node) {
+    if (node.nodeType === Node.TEXT_NODE) return node.textContent;
+    const tag   = node.tagName?.toLowerCase();
+    const inner = Array.from(node.childNodes).map(nodeToMd).join('');
+    if (tag === 'h1') return '\n# ' + inner + '\n';
+    if (tag === 'h2') return '\n## ' + inner + '\n';
+    if (tag === 'h3') return '\n### ' + inner + '\n';
+    if (tag === 'strong' || tag === 'b') return '**' + inner + '**';
+    if (tag === 'em'     || tag === 'i') return '_'  + inner + '_';
+    if (tag === 'u') return inner;
+    if (tag === 'pre' || tag === 'code') return '\n```\n' + node.textContent + '\n```\n';
+    if (tag === 'a') return '[' + inner + '](' + (node.href || '#') + ')';
+    if (tag === 'li') return '- ' + inner + '\n';
+    if (tag === 'ul' || tag === 'ol') return '\n' + inner;
+    if (tag === 'br') return '\n';
+    if (tag === 'p' || tag === 'div') return '\n' + inner + '\n';
+    return inner;
+  }
+  return Array.from(div.childNodes).map(nodeToMd).join('').replace(/\n{3,}/g, '\n\n').trim();
+}
+function exportNoteAsMarkdown() {
+  const note = state.notes.find(n => n.id === state.selectedNoteId);
+  if (!note) return;
+  const title = note.title || 'Untitled';
+  const body  = noteHtmlToMarkdown(note.content || '');
+  const md    = '# ' + title + '\n\n' + body + '\n';
+  const blob  = new Blob([md], { type: 'text/markdown' });
+  const url   = URL.createObjectURL(blob);
+  const a     = document.createElement('a');
+  a.href      = url;
+  a.download  = (title.replace(/[^a-z0-9- ]/gi, '').trim() || 'note') + '.md';
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 10000);
+  toast('Note exported as Markdown \u2713');
+}
+
+$('btn-export-note')?.addEventListener('click', exportNoteAsMarkdown);
+
+$('btn-delete-note').onclick = () => {
   if (!state.selectedNoteId) return;
-  await fbDeleteNote(state.selectedNoteId);
-  state.selectedNoteId = null;
-  $('note-empty-state').hidden   = false;
-  $('note-editor-content').hidden= true;
-  renderNotesList();
-  toast('Note deleted');
+  const note = state.notes.find(n => n.id === state.selectedNoteId);
+  const name = note?.title ? `"${note.title}"` : 'this note';
+  confirmDelete(`Delete ${name}? This cannot be undone.`, async () => {
+    await fbDeleteNote(state.selectedNoteId);
+    state.selectedNoteId = null;
+    $('note-empty-state').hidden   = false;
+    $('note-editor-content').hidden= true;
+    renderNotesList();
+    toast('Note deleted');
+  });
 };
 
 // FIX 4: After persisting title/content to local state, call renderNotesList()
 // so the sidebar preview reflects the latest changes immediately.
+
+/** Flush any pending autosave immediately. Safe to call even if nothing is pending. */
+async function noteSaveNow() {
+  clearTimeout(noteAutoSaveTimer);
+  noteAutoSaveTimer = null;
+  if (!state.selectedNoteId) return;
+  const title   = $('note-title-input').value.trim() || 'Untitled';
+  const content = $('note-editor').innerHTML;
+  const updatedAt = Date.now();
+  const note = state.notes.find(n => n.id === state.selectedNoteId);
+  if (note) {
+    // Skip write if nothing changed since last save
+    if (note.title === title && note.content === content) {
+      $('note-save-status').textContent = 'Saved';
+      return;
+    }
+    note.title     = title;
+    note.content   = content;
+    note.updatedAt = updatedAt;
+    renderNotesList();
+  }
+  try {
+    await fbUpdateNote(state.selectedNoteId, { title, content, updatedAt });
+    $('note-save-status').textContent = 'Saved';
+  } catch (err) {
+    console.error('[Flow] Note save failed:', err);
+    $('note-save-status').textContent = 'Save failed';
+    toast('Could not save note. Check your connection.');
+  }
+}
+
 function noteAutoSave() {
   clearTimeout(noteAutoSaveTimer);
   $('note-save-status').textContent = 'Saving…';
-  noteAutoSaveTimer = setTimeout(async () => {
-    if (!state.selectedNoteId) return;
-    const title   = $('note-title-input').value.trim() || 'Untitled';
-    const content = $('note-editor').innerHTML;
-    const updatedAt = Date.now();
-    // Optimistically update local state first so the sidebar preview is immediate.
-    const note = state.notes.find(n => n.id === state.selectedNoteId);
-    if (note) {
-      note.title     = title;
-      note.content   = content;
-      note.updatedAt = updatedAt;
-      renderNotesList();
-    }
-    try {
-      await fbUpdateNote(state.selectedNoteId, { title, content, updatedAt });
-      $('note-save-status').textContent = 'Saved';
-    } catch (err) {
-      console.error('[Flow] Note save failed:', err);
-      $('note-save-status').textContent = 'Save failed';
-      toast('Could not save note. Check your connection.');
-    }
-  }, 1000);
+  noteAutoSaveTimer = setTimeout(noteSaveNow, 1000);
 }
 
 $('note-title-input').addEventListener('input', noteAutoSave);
-$('note-editor').addEventListener('input', noteAutoSave);
+$('note-title-input').addEventListener('blur',  noteSaveNow);
+$('note-editor').addEventListener('input',      noteAutoSave);
+$('note-editor').addEventListener('blur',       noteSaveNow);
 $('note-search-input')?.addEventListener('input', renderNotesList);
 
 // Formatting toolbar
@@ -1543,6 +1664,67 @@ function renderProductivity() {
 }
 
 // ─── POMODORO ─────────────────────────────────────────────────────────────────
+// Request notification permission lazily (only when the user starts the timer).
+// Never request on page load. Fail silently — the timer works regardless.
+
+/** Play a short completion beep via the Web Audio API. Respects the sound toggle. */
+function pomodoroBeep() {
+  if (!state.pomodoro.sound) return;
+  try {
+    const ctx  = new (window.AudioContext || window.webkitAudioContext)();
+    const osc  = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.connect(gain); gain.connect(ctx.destination);
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(880, ctx.currentTime);
+    osc.frequency.exponentialRampToValueAtTime(440, ctx.currentTime + 0.4);
+    gain.gain.setValueAtTime(0.4, ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.5);
+    osc.start(ctx.currentTime);
+    osc.stop(ctx.currentTime + 0.5);
+    osc.onended = () => ctx.close();
+  } catch (_) { /* AudioContext blocked — non-fatal */ }
+}
+
+function applyPomodoroSettings() {
+  const focusMin = Math.max(1, Math.min(120, parseInt($('pomo-focus-input')?.value)||25));
+  const shortMin = Math.max(1, Math.min(60,  parseInt($('pomo-short-input')?.value)||5));
+  const longMin  = Math.max(1, Math.min(120, parseInt($('pomo-long-input')?.value)||15));
+  const p = state.pomodoro;
+  p.work       = focusMin * 60;
+  p.shortBreak = shortMin * 60;
+  p.longBreak  = longMin  * 60;
+  clearInterval(p.timer);
+  p.running = false; p.session = 1; p.mode = 'work'; p.remaining = p.work;
+  updatePomodoroDisplay();
+  // Persist in settings so preferences survive Demo reload
+  state.settings.pomodoroDurations = { focusMin, shortMin, longMin };
+  DB.save();
+  toast('Pomodoro settings applied');
+}
+
+function syncPomodoroSettingsUI() {
+  const d = state.settings.pomodoroDurations || {};
+  if ($('pomo-focus-input')) $('pomo-focus-input').value = d.focusMin || 25;
+  if ($('pomo-short-input')) $('pomo-short-input').value = d.shortMin || 5;
+  if ($('pomo-long-input'))  $('pomo-long-input').value  = d.longMin  || 15;
+  const soundToggle = $('pomo-sound-toggle');
+  if (soundToggle) {
+    const on = state.pomodoro.sound !== false;
+    soundToggle.classList.toggle('on', on);
+    soundToggle.setAttribute('aria-checked', String(on));
+  }
+}
+
+function requestNotifPermission() {
+  if (!('Notification' in window)) return;
+  if (Notification.permission === 'default') Notification.requestPermission();
+}
+function sendNotif(title, body) {
+  if (!('Notification' in window) || Notification.permission !== 'granted') return;
+  try { new Notification(title, { body, icon: '', tag: 'flow-pomodoro', silent: false }); }
+  catch (_) { /* ignore – some browsers block Notification in cross-origin iframes */ }
+}
 function updatePomodoroDisplay() {
   const p = state.pomodoro;
   const m = Math.floor(p.remaining / 60);
@@ -1560,6 +1742,7 @@ $('pomodoro-start').onclick = () => {
     clearInterval(p.timer);
     p.running = false;
   } else {
+    requestNotifPermission(); // lazy — only on first Start press
     p.running = true;
     p.timer   = setInterval(() => {
       p.remaining--;
@@ -1570,11 +1753,16 @@ $('pomodoro-start').onclick = () => {
           p.session++;
           p.mode      = p.session % 4 === 0 ? 'longBreak' : 'shortBreak';
           p.remaining = p.mode === 'longBreak' ? p.longBreak : p.shortBreak;
+          const breakLabel = p.mode === 'longBreak' ? 'Long break time (15 min)' : 'Short break time (5 min)';
+          pomodoroBeep();
           toast('Focus session complete! Take a break. 🎉');
+          sendNotif('Focus session complete! 🎉', breakLabel);
         } else {
           p.mode      = 'work';
           p.remaining = p.work;
+          pomodoroBeep();
           toast('Break over. Back to focus! 💪');
+          sendNotif('Break over 💪', 'Time for another focus session.');
         }
       }
       updatePomodoroDisplay();
@@ -1596,6 +1784,21 @@ $('pomodoro-skip').onclick = () => {
   updatePomodoroDisplay();
 };
 
+// Wire Pomodoro settings controls (elements may not exist if view not yet rendered)
+document.addEventListener('DOMContentLoaded', () => {
+  $('pomo-apply-btn')?.addEventListener('click', applyPomodoroSettings);
+  const soundToggle = $('pomo-sound-toggle');
+  if (soundToggle) {
+    const toggleSound = () => {
+      state.pomodoro.sound = !state.pomodoro.sound;
+      soundToggle.classList.toggle('on', state.pomodoro.sound);
+      soundToggle.setAttribute('aria-checked', String(state.pomodoro.sound));
+    };
+    soundToggle.addEventListener('click',   toggleSound);
+    soundToggle.addEventListener('keydown', e => (e.key === 'Enter' || e.key === ' ') && (e.preventDefault(), toggleSound()));
+  }
+});
+
 // ─── SEARCH ───────────────────────────────────────────────────────────────────
 let searchTimer = null;
 $('search-input').addEventListener('input', e => {
@@ -1608,17 +1811,64 @@ document.addEventListener('click', e => {
     $('search-results').classList.remove('visible');
 });
 
+/**
+ * Parse filter tokens from a query string.
+ * Supported: p:1  p:2  p:3  p:4  #labelname  @projectname  done:yes  done:no
+ * Returns { text, priority, labelName, projectName, done }
+ */
+function parseSearchFilters(query) {
+  const filters = { text: '', priority: null, labelName: null, projectName: null, done: null };
+  const tokens  = query.split(/\s+/);
+  const text    = [];
+  tokens.forEach(tok => {
+    const low = tok.toLowerCase();
+    if (/^p:[1-4]$/.test(low))          { filters.priority    = parseInt(low[2]); return; }
+    if (low.startsWith('#') && low.length > 1) { filters.labelName   = low.slice(1); return; }
+    if (low.startsWith('@') && low.length > 1) { filters.projectName = low.slice(1); return; }
+    if (low === 'done:yes' || low === 'done:true')  { filters.done = true;  return; }
+    if (low === 'done:no'  || low === 'done:false') { filters.done = false; return; }
+    text.push(tok);
+  });
+  filters.text = text.join(' ').toLowerCase().trim();
+  return filters;
+}
+
+function filterTasks(tasks, filters) {
+  return tasks.filter(t => {
+    if (filters.text && !t.title.toLowerCase().includes(filters.text) && !(t.desc||'').toLowerCase().includes(filters.text)) return false;
+    if (filters.priority  !== null && (t.priority||4) !== filters.priority) return false;
+    if (filters.done      !== null && t.done !== filters.done)              return false;
+    if (filters.labelName) {
+      const label = state.labels.find(l => l.id === t.labelId);
+      if (!label || !label.name.toLowerCase().includes(filters.labelName)) return false;
+    }
+    if (filters.projectName) {
+      const proj = state.projects.find(p => p.id === t.projectId);
+      if (!proj || !proj.name.toLowerCase().includes(filters.projectName)) return false;
+    }
+    return true;
+  });
+}
+
 function renderSearchResults(query) {
   const results = $('search-results');
   if (!query) { results.classList.remove('visible'); return; }
-  const q = query.toLowerCase();
 
-  const taskMatches    = state.tasks.filter(t => t.title.toLowerCase().includes(q) || (t.desc||'').toLowerCase().includes(q)).slice(0,5);
-  const noteMatches    = state.notes.filter(n => n.title.toLowerCase().includes(q) || (n.content||'').replace(/<[^>]+>/g,'').toLowerCase().includes(q)).slice(0,3);
-  const projectMatches = state.projects.filter(p => p.name.toLowerCase().includes(q)).slice(0,2);
+  const filters = parseSearchFilters(query);
+  const q       = filters.text;
+
+  // Filter tasks using the full filter set; notes/projects use plain text only.
+  const taskMatches    = filterTasks(state.tasks, filters).slice(0, 6);
+  const noteMatches    = q ? state.notes.filter(n =>
+    n.title.toLowerCase().includes(q) ||
+    (n.content||'').replace(/<[^>]+>/g,'').toLowerCase().includes(q)
+  ).slice(0,3) : [];
+  const projectMatches = q ? state.projects.filter(p => p.name.toLowerCase().includes(q)).slice(0,2) : [];
 
   if (!taskMatches.length && !noteMatches.length && !projectMatches.length) {
-    results.innerHTML = `<div style="padding:16px;text-align:center;color:var(--text-muted);font-size:13px">No results for "${escapeHtml(query)}"</div>`;
+    const hint = (!q && (filters.priority || filters.labelName || filters.projectName))
+      ? '' : '';
+    results.innerHTML = `<div style="padding:12px 16px;text-align:center;color:var(--text-muted);font-size:13px">No results for "${escapeHtml(query)}"<br><span style="font-size:11px;margin-top:4px;display:block;opacity:0.7">Try p:1–4, #label, @project, done:yes/no</span></div>`;
   } else {
     results.innerHTML = '';
     const addResult = (typeLabel, title, sub, onclick) => {
@@ -1628,9 +1878,9 @@ function renderSearchResults(query) {
       item.onclick = onclick;
       results.appendChild(item);
     };
-    taskMatches.forEach(t    => addResult('Task',    t.title,          t.dueDate ? formatDate(t.dueDate) : '', () => { openDetail(t.id); clearSearch(); }));
-    noteMatches.forEach(n    => addResult('Note',    n.title||'Untitled', '',                                  () => { navigate('notes'); setTimeout(() => openNote(n.id), 100); clearSearch(); }));
-    projectMatches.forEach(p => addResult('Project', p.name,           '',                                     () => { navigate('project', { projectId: p.id }); clearSearch(); }));
+    taskMatches.forEach(t    => addResult(t.done ? 'Done' : 'Task', t.title, t.dueDate ? formatDate(t.dueDate) : '', () => { openDetail(t.id); clearSearch(); }));
+    noteMatches.forEach(n    => addResult('Note',    n.title||'Untitled', '',  () => { navigate('notes'); setTimeout(() => openNote(n.id), 100); clearSearch(); }));
+    projectMatches.forEach(p => addResult('Project', p.name,           '',     () => { navigate('project', { projectId: p.id }); clearSearch(); }));
   }
   results.classList.add('visible');
 }
@@ -1640,23 +1890,68 @@ function clearSearch() {
 }
 
 // ─── MODALS ───────────────────────────────────────────────────────────────────
+// Track the element that triggered the most-recently opened modal so focus
+// can be returned when the modal closes.
+let _modalTrigger = null;
+
 function openModal(id) {
   const overlay = $(id);
+  const appEl   = $('app');
+
+  // Remember what had focus before we trap it in the modal.
+  _modalTrigger = document.activeElement;
+
   overlay.classList.add('open');
-  // Lock body scroll so background content doesn't scroll behind modal on mobile
   document.body.classList.add('modal-open');
-  // Hide app from screen readers while modal is open
-  $('app')?.setAttribute('aria-hidden', 'true');
+
+  // inert disables all interaction with the background (focus, pointer, AT)
+  // without triggering the "aria-hidden descendant still has focus" warning,
+  // because inert removes all descendants from the tab order immediately.
+  if (appEl) appEl.inert = true;
+
   overlay.onclick = e => { if (e.target === overlay) closeModal(id); };
+
+  // Move focus into the modal synchronously — after inert is set so the trigger
+  // is already out of the tab order and no "focus inside hidden subtree" warning fires.
+  const firstFocusable = overlay.querySelector(
+    'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+  );
+  firstFocusable?.focus();
 }
 function closeModal(id) {
   $(id).classList.remove('open');
-  // Only unlock scroll if no other modals are still open
   const anyOpen = document.querySelector('.modal-overlay.open');
   if (!anyOpen) {
     document.body.classList.remove('modal-open');
-    $('app')?.removeAttribute('aria-hidden');
+    // Restore background interactivity.
+    const appEl = $('app');
+    if (appEl) appEl.inert = false;
+    // Return focus to the element that opened the modal, if still focusable.
+    try {
+      if (_modalTrigger && typeof _modalTrigger.focus === 'function' &&
+          document.contains(_modalTrigger) && !_modalTrigger.disabled) {
+        _modalTrigger.focus();
+      }
+    } catch (_) {}
+    _modalTrigger = null;
   }
+}
+
+// ─── CONFIRM DELETE ───────────────────────────────────────────────────────────
+// Single reusable confirmation dialog for all destructive actions.
+// Usage: confirmDelete('Are you sure…?', () => doTheDelete());
+function confirmDelete(message, onConfirm, confirmLabel = 'Delete') {
+  $('confirm-modal-message').textContent = message;
+  $('confirm-modal-title').textContent   = confirmLabel === 'Delete' ? 'Confirm delete' : 'Confirm import';
+  openModal('confirm-modal-overlay');
+  // Clone to strip previous listeners
+  const okBtn    = $('confirm-modal-ok');
+  const newOkBtn = okBtn.cloneNode(true);
+  newOkBtn.textContent = confirmLabel;
+  okBtn.parentNode.replaceChild(newOkBtn, okBtn);
+  newOkBtn.onclick = () => { closeModal('confirm-modal-overlay'); onConfirm(); };
+  $('confirm-modal-close').onclick  = () => closeModal('confirm-modal-overlay');
+  $('confirm-modal-cancel').onclick = () => closeModal('confirm-modal-overlay');
 }
 
 // ─── KEYBOARD SHORTCUTS ───────────────────────────────────────────────────────
@@ -1669,6 +1964,7 @@ document.addEventListener('keydown', e => {
     closeModal('project-modal-overlay');
     closeModal('label-modal-overlay');
     closeModal('profile-modal-overlay');
+    closeModal('confirm-modal-overlay');
     closeDetail();
     $('search-results').classList.remove('visible');
     return;
@@ -1705,6 +2001,68 @@ document.querySelectorAll('[data-view]').forEach(item => {
   item.addEventListener('click', () => {
     if (window.innerWidth < 768) closeMobileSidebar();
   });
+});
+
+// ─── EXPORT / IMPORT ──────────────────────────────────────────────────────────
+function exportData() {
+  const payload = {
+    _version: 1,
+    _exported: new Date().toISOString(),
+    tasks:    state.tasks,
+    projects: state.projects,
+    labels:   state.labels,
+    notes:    state.notes,
+    settings: state.settings
+  };
+  const json = JSON.stringify(payload, null, 2);
+  const blob = new Blob([json], { type: 'application/json' });
+  const url  = URL.createObjectURL(blob);
+  const a    = document.createElement('a');
+  a.href     = url;
+  a.download = `flow-backup-${toDateStr(new Date())}.json`;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 10000);
+  toast('Data exported ✓');
+}
+
+function importData(file) {
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = e => {
+    let parsed;
+    try {
+      parsed = JSON.parse(e.target.result);
+    } catch (_) {
+      toast('Import failed: not a valid JSON file.'); return;
+    }
+    // Validate the minimum expected shape
+    if (!parsed || typeof parsed !== 'object' || !Array.isArray(parsed.tasks)) {
+      toast('Import failed: file does not look like a Flow backup.'); return;
+    }
+    const taskCount = parsed.tasks.length;
+    const msg = `Import will replace all current data with ${taskCount} task${taskCount !== 1 ? 's' : ''} from the backup. This cannot be undone.`;
+    confirmDelete(msg, () => {
+      state.tasks    = Array.isArray(parsed.tasks)    ? parsed.tasks    : [];
+      state.projects = Array.isArray(parsed.projects) ? parsed.projects : DEFAULT_PROJECTS;
+      state.labels   = Array.isArray(parsed.labels)   ? parsed.labels   : DEFAULT_LABELS;
+      state.notes    = Array.isArray(parsed.notes)    ? parsed.notes    : [];
+      if (parsed.settings && typeof parsed.settings === 'object') {
+        state.settings = { ...state.settings, ...parsed.settings };
+      }
+      DB.save();
+      applySettings();
+      renderAll();
+      toast(`Imported ${taskCount} tasks successfully ✓`);
+    }, 'Import');
+  };
+  reader.onerror = () => toast('Import failed: could not read file.');
+  reader.readAsText(file);
+}
+
+$('btn-export-data')?.addEventListener('click', exportData);
+$('import-data-input')?.addEventListener('change', e => {
+  importData(e.target.files?.[0]);
+  e.target.value = ''; // reset so same file can be re-imported
 });
 
 // ─── INIT ─────────────────────────────────────────────────────────────────────
@@ -1764,7 +2122,16 @@ async function init() {
     }
   }
 
+  // Restore saved Pomodoro durations if present
+  const pd = state.settings.pomodoroDurations;
+  if (pd) {
+    state.pomodoro.work       = (pd.focusMin || 25) * 60;
+    state.pomodoro.shortBreak = (pd.shortMin || 5)  * 60;
+    state.pomodoro.longBreak  = (pd.longMin  || 15) * 60;
+    state.pomodoro.remaining  = state.pomodoro.work;
+  }
   updatePomodoroDisplay();
+  syncPomodoroSettingsUI();
 }
 
 init();
