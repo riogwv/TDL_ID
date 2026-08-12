@@ -2,6 +2,11 @@
 // Flow Service Worker — shell caching only.
 // Firebase CDN scripts, Firestore, and Auth are network-only so we never
 // accidentally serve stale auth tokens or SDK versions from cache.
+//
+// DEPLOYMENT NOTE: bump CACHE (e.g. flow-shell-v2, flow-shell-v3) whenever
+// you change app.js, style.css, or index.html so users receive the updated
+// files instead of the cached version. The activate handler automatically
+// deletes the previous cache version.
 
 const CACHE = 'flow-shell-v1';
 

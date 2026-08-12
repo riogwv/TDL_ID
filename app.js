@@ -105,6 +105,36 @@ function escapeHtml(str) {
     .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
+/**
+ * Sanitize note HTML before inserting into the contenteditable editor.
+ * Notes use rich text (bold, headings, lists, links) so textContent is
+ * insufficient. We parse into a detached element, strip dangerous attributes
+ * (on* event handlers, javascript: URIs) and remove script/iframe elements,
+ * then return the cleaned HTML. No external library required.
+ *
+ * Primary protection: malicious imported JSON backup files whose note.content
+ * contains event-handler payloads (e.g. <img src=x onerror=alert(1)>).
+ */
+function sanitizeNoteHtml(html) {
+  if (!html) return '';
+  const tmp = document.createElement('div');
+  tmp.innerHTML = html; // parse into detached DOM; <script> does not execute here
+  tmp.querySelectorAll('*').forEach(node => {
+    // Strip all on* event-handler attributes
+    Array.from(node.attributes).forEach(attr => {
+      if (/^on/i.test(attr.name)) node.removeAttribute(attr.name);
+    });
+    // Strip javascript: from href / src / action
+    ['href', 'src', 'action'].forEach(a => {
+      const v = node.getAttribute(a);
+      if (v && /^\s*javascript:/i.test(v)) node.removeAttribute(a);
+    });
+  });
+  // Remove elements that have no place in note content
+  tmp.querySelectorAll('script,iframe,object,embed,form').forEach(n => n.remove());
+  return tmp.innerHTML;
+}
+
 function toast(msg, duration = 3000) {
   const c = $('toast-container');
   const t = el('div', 'toast', escapeHtml(msg));
@@ -1486,7 +1516,7 @@ function openNote(id) {
   $('note-empty-state').hidden   = true;
   $('note-editor-content').hidden= false;
   $('note-title-input').value    = note.title   || '';
-  $('note-editor').innerHTML     = note.content || '';
+  $('note-editor').innerHTML     = sanitizeNoteHtml(note.content);
   $('note-save-status').textContent = 'Saved';
   renderNotesList();
 }
